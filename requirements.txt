@@ -1,0 +1,8 @@
+gradio>=4.0
+faiss-cpu
+sentence-transformers
+pdfplumber
+pytesseract
+pdf2image
+requests
+numpy   

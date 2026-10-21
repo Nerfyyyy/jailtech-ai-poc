@@ -2,26 +2,27 @@ import re, hashlib, os, json, datetime, requests
 from pathlib import Path
 import numpy as np
 import faiss
-from sentence_transformers import SentenceTransformer
+from fastembed import TextEmbedding
 import gradio as gr
 
 # ═══════════════════════════════════════════
 # CONFIG
 # ═══════════════════════════════════════════
-EMBED_MODEL = "all-MiniLM-L6-v2"
+EMBED_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 TOP_K = 3
 GROQ_KEY = os.environ.get("GROQ_API_KEY", "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")
 
 # ═══════════════════════════════════════════
-# LOAD PRE-BUILT INDEX
+# LOAD PRE-BUILT INDEX (ONNX)
 # ═══════════════════════════════════════════
-print("Loading pre-built index...")
-index = faiss.read_index("jailtech.index")
+print("Loading pre-built index (ONNX)...")
+index = faiss.read_index("jailtech_onnx.index")
 with open("chunks.json") as f:
     chunks = json.load(f)
 print(f"Index loaded: {index.ntotal} vectors, dim={index.d}")
 
-retriever_model = SentenceTransformer(EMBED_MODEL)
+print("Loading embedding model (ONNX Runtime)...")
+embedder = TextEmbedding(EMBED_MODEL)
 print("Embedding model loaded.")
 
 # ═══════════════════════════════════════════
@@ -109,6 +110,15 @@ def generate_groq(prompt):
         return f"[Error: {str(e)}]"
 
 # ═══════════════════════════════════════════
+# EMBEDDING (ONNX — ~50 MB instead of PyTorch ~250 MB)
+# ═══════════════════════════════════════════
+def encode_text(text):
+    vecs = np.array(list(embedder.embed([text]))).astype("float32")
+    norms = np.linalg.norm(vecs, axis=1, keepdims=True)
+    norms[norms == 0] = 1
+    return vecs / norms
+
+# ═══════════════════════════════════════════
 # QUERY REWRITING
 # ═══════════════════════════════════════════
 def rewrite_query(query, history):
@@ -178,8 +188,7 @@ def chat_fn(query, history):
         return meta + "\n" + CONTACT_INFO
 
     rewritten = rewrite_query(query, history)
-    q = retriever_model.encode([rewritten], normalize_embeddings=True)
-    q = np.asarray(q, dtype="float32")
+    q = encode_text(rewritten)
     scores, idxs = index.search(q, TOP_K)
     hits = []
     for score, i in zip(scores[0], idxs[0]):

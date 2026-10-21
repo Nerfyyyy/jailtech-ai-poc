@@ -2,9 +2,6 @@ import re, hashlib, os, json, datetime, requests
 from pathlib import Path
 import numpy as np
 import faiss
-import pdfplumber
-import pytesseract
-from pdf2image import convert_from_path
 from sentence_transformers import SentenceTransformer
 import gradio as gr
 
@@ -12,15 +9,43 @@ import gradio as gr
 # CONFIG
 # ═══════════════════════════════════════════
 EMBED_MODEL = "all-MiniLM-L6-v2"
-CC_CHUNK = 250
-CC_OVERLAP = 50
-STD_CHUNK = 600
-STD_OVERLAP = 100
 TOP_K = 3
 GROQ_KEY = os.environ.get("GROQ_API_KEY", "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")
-CORPUS_DIR = Path("corpus")
-CORPUS_DIR.mkdir(exist_ok=True)
 
+# ═══════════════════════════════════════════
+# LOAD PRE-BUILT INDEX
+# ═══════════════════════════════════════════
+print("Loading pre-built index...")
+index = faiss.read_index("jailtech.index")
+with open("chunks.json") as f:
+    chunks = json.load(f)
+print(f"Index loaded: {index.ntotal} vectors, dim={index.d}")
+
+retriever_model = SentenceTransformer(EMBED_MODEL)
+print("Embedding model loaded.")
+
+# ═══════════════════════════════════════════
+# CONTACT INFO (verified from bjmp.gov.ph)
+# ═══════════════════════════════════════════
+CONTACT_INFO = """
+---
+**For further inquiries:**
+
+| Office | Trunk Line | Email |
+|--------|-----------|-------|
+| BJMP NHQ (Quezon City) | (02) 8927-6383, 8926-7756, 8927-5505, 8927-6154 | [cdsmessagecenter@bjmp.gov.ph](mailto:cdsmessagecenter@bjmp.gov.ph) |
+| BJMP Region IV-A (CALABARZON) | +63-932-883-8754 | [bjmpro4a@bjmp.gov.ph](mailto:bjmpro4a@bjmp.gov.ph) |
+| Region I (Cagayan Valley) | (072) 619-5493; 0920-590-463 | [r1.messagecenter@bjmp.gov.ph](mailto:r1.messagecenter@bjmp.gov.ph) |
+| Region V (Bicol) | 0948-318-2616; 0927-478-3212 | [bjmpro5@bjmp.gov.ph](mailto:bjmpro5@bjmp.gov.ph) |
+| Region VI (Western Visayas) | (033) 338-2847 | — |
+| Region IX (Western Mindanao) | (062) 925-3979 | [bjmpro9@bjmp.gov.ph](mailto:bjmpro9@bjmp.gov.ph) |
+
+*For other regional offices and jail units, visit: [bjmp.gov.ph/facilities/list-of-jails](https://bjmp.gov.ph/facilities/list-of-jails)*
+"""
+
+# ═══════════════════════════════════════════
+# DOCUMENT URLs
+# ═══════════════════════════════════════════
 DOC_URLS = {
     "BJMP-ODCA-MC-167": "https://barmm.bjmp.gov.ph/wp-content/uploads/2025/05/03.31.2025-BJMP-ODCA-MC-167-CITIZENS-CHARTER.pdf",
     "BJMP-COM-2015": "https://car.bjmp.gov.ph/wp-content/uploads/2024/11/BJMP-Comprehensive-Operations-Manual-2015-Edition.pdf",
@@ -29,122 +54,38 @@ DOC_URLS = {
     "BJMP-DICTM-MC-128": "https://sites.google.com/bjmp.gov.ph/ictmdjsioc/dictm-memorandum-circular",
     "BJMP-DPRM-MC-73": "https://bjmp.gov.ph/policies/",
     "BJMP-CDS-MC-133": "https://www.scribd.com/document/823657970/02-21-2022-Mc-on-Communications-Policy",
+    "BJMP-DPRM-MC-034": "https://bjmp.gov.ph/policies/",
+    "BJMP-DO-MC-038": "https://bjmp.gov.ph/policies/",
+    "BJMP-DICTM-MC-161": "https://car.bjmp.gov.ph/policies/",
+    "BJMP-DHRD-MC-117": "https://bjmp.gov.ph/policies/",
+    "BJMP-MSJ-2024": "https://calabarzon.bjmp.gov.ph/downloadable-manuals/",
 }
 
-CORPUS_DEFS = [
-    {"file": "citizens_charter.pdf", "url": DOC_URLS["BJMP-ODCA-MC-167"], "title": "BJMP Citizen's Charter 2025", "doc_no": "BJMP-ODCA-MC-167", "date": "2025", "chunk": CC_CHUNK, "overlap": CC_OVERLAP},
-    {"file": "operations_manual.pdf", "url": DOC_URLS["BJMP-COM-2015"], "title": "BJMP Comprehensive Operations Manual 2015", "doc_no": "BJMP-COM-2015", "date": "2015", "chunk": STD_CHUNK, "overlap": STD_OVERLAP},
-    {"file": "foi_manual.pdf", "url": DOC_URLS["BJMP-FOI-2021"], "title": "BJMP Freedom of Information Manual", "doc_no": "BJMP-FOI-2021", "date": "2021", "chunk": STD_CHUNK, "overlap": STD_OVERLAP},
-]
+# ═══════════════════════════════════════════
+# SUGGESTED FOLLOW-UPS
+# ═══════════════════════════════════════════
+SUGGESTIONS = {
+    "BJMP-ODCA-MC-167": ["What are the requirements for this service?", "What is the processing time?", "Where do I submit the request?"],
+    "BJMP-COM-2015": ["What is the organizational structure?", "Who reports to the Director?", "What are the duties of this position?"],
+    "BJMP-FOI-2021": ["How long does it take?", "What if my request is denied?", "Who is the FOI Officer?"],
+    "BJMP-LSO-MC-124": ["What are the grounds for disciplinary action?", "What is the appeal process?", "Who sits on the disciplinary board?"],
+    "BJMP-DICTM-MC-128": ["What are the acceptable use rules?", "What is the retention period?", "Who administers the e-mail system?"],
+    "BJMP-DPRM-MC-73": ["What is the record-keeping procedure?", "How are transfers processed?", "Who has access to personnel records?"],
+    "BJMP-CDS-MC-133": ["What is the document routing procedure?", "How are inter-office memos handled?", "What is the classification level?"],
+    "BJMP-DPRM-MC-034": ["What are the ranks in order?", "What is the equivalent of this rank?", "How is promotion handled?"],
+    "BJMP-DO-MC-038": ["What services do the help desks provide?", "What are the operating hours?", "How do I access the help desk?"],
+    "BJMP-DICTM-MC-161": ["Who can use digital signatures?", "What documents require a digital signature?", "How is identity verified?"],
+    "BJMP-DHRD-MC-117": ["What training programs are available?", "What is the scholarship process?", "What is the service obligation?"],
+    "BJMP-MSJ-2024": ["What are the minimum space requirements?", "What are the ventilation standards?", "What are the fire safety requirements?"],
+}
 
 # ═══════════════════════════════════════════
-# DOWNLOAD PDFs AT STARTUP
+# META-QUESTION HANDLER
 # ═══════════════════════════════════════════
-def download_pdf(url, dest):
-    if dest.exists():
-        print(f"  [cached] {dest.name}")
-        return True
-    try:
-        r = requests.get(url, timeout=60)
-        if r.status_code == 200 and len(r.content) > 10000:
-            dest.write_bytes(r.content)
-            print(f"  [downloaded] {dest.name} ({len(r.content)//1024} KB)")
-            return True
-    except Exception as e:
-        print(f"  [failed] {dest.name}: {e}")
-    return False
-
-print("═══ DOWNLOADING CORPUS ═══")
-for cd in CORPUS_DEFS:
-    download_pdf(cd["url"], CORPUS_DIR / cd["file"])
-
-# ═══════════════════════════════════════════
-# EXTRACT + CHUNK
-# ═══════════════════════════════════════════
-def clean_text(txt):
-    txt = txt.replace("\u00ad", "")
-    txt = re.sub(r"(\w)-\n(\w)", r"\1\2", txt)
-    txt = re.sub(r"\n{3,}", "\n\n", txt)
-    txt = re.sub(r"[ \t]{2,}", " ", txt)
-    return txt.strip()
-
-def extract_pdf(path):
-    pages = []
-    with pdfplumber.open(str(path)) as pdf:
-        for i, pg in enumerate(pdf.pages, start=1):
-            txt = clean_text(pg.extract_text() or "")
-            if txt:
-                pages.append({"page": i, "text": txt})
-    total_chars = sum(len(p["text"]) for p in pages)
-    if total_chars > 2000:
-        return pages, "text"
-    print("    → Using OCR...")
-    ocr_pages = convert_from_path(str(path), dpi=200)
-    results = []
-    for i, page in enumerate(ocr_pages, start=1):
-        txt = clean_text(pytesseract.image_to_string(page))
-        if txt and len(txt) > 20:
-            results.append({"page": i, "text": txt})
-    return results, "ocr"
-
-def approx_tokens(text):
-    return len(text.split())
-
-def make_chunk(text, meta, pages):
-    page_label = f"p.{pages[0]}" if len(set(pages)) == 1 else f"pp.{min(pages)}-{max(pages)}"
-    cid = hashlib.sha1(f"{meta['doc_no']}|{page_label}|{text[:120]}".encode()).hexdigest()[:12]
-    return {"chunk_id": cid, "doc_title": meta["title"], "doc_no": meta["doc_no"],
-            "doc_date": meta.get("date",""), "section": page_label, "text": text}
-
-def chunk_pages(pages, meta, size, overlap):
-    ch = []
-    step = size - overlap
-    if step <= 0:
-        step = size // 2
-    buffer, buffer_pages = [], []
-    for page in pages:
-        buffer.append(page["text"])
-        buffer_pages.append(page["page"])
-        joined = "\n".join(buffer)
-        while approx_tokens(joined) >= size:
-            words = joined.split()
-            window = " ".join(words[:size])
-            ch.append(make_chunk(window, meta, buffer_pages))
-            remaining = " ".join(words[step:])
-            joined = remaining
-            buffer = [remaining]
-    if buffer and approx_tokens("\n".join(buffer)) > 20:
-        ch.append(make_chunk("\n".join(buffer), meta, buffer_pages))
-    return ch
-
-print("\n═══ EXTRACTING & CHUNKING ═══")
-all_chunks = []
-for cd in CORPUS_DEFS:
-    f = CORPUS_DIR / cd["file"]
-    if not f.exists():
-        print(f"  SKIP (not downloaded): {cd['title']}")
-        continue
-    pages, method = extract_pdf(f)
-    if not pages:
-        print(f"  SKIP (no text): {cd['title']}")
-        continue
-    doc_chunks = chunk_pages(pages, cd, cd["chunk"], cd["overlap"])
-    all_chunks.extend(doc_chunks)
-    print(f"  ✓ {cd['title']}: {len(pages)} pages → {len(doc_chunks)} chunks [{method}]")
-
-print(f"\nTotal chunks: {len(all_chunks)}")
-
-# ═══════════════════════════════════════════
-# BUILD INDEX
-# ═══════════════════════════════════════════
-print("\n═══ BUILDING INDEX ═══")
-retriever_model = SentenceTransformer(EMBED_MODEL)
-embeddings = retriever_model.encode([c["text"] for c in all_chunks], normalize_embeddings=True, show_progress_bar=True)
-embeddings = np.asarray(embeddings, dtype="float32")
-index = faiss.IndexFlatIP(embeddings.shape[1])
-index.add(embeddings)
-chunks = all_chunks
-print(f"Index built: {index.ntotal} vectors")
+META_RESPONSES = {
+    "search engine": "This system is more convenient than a search engine in three ways: (1) It reads the documents for you and synthesizes one grounded answer instead of giving you 10 PDF links to read manually. (2) It remembers context between turns, so you can ask follow-ups without repeating the full question. (3) It refuses to answer what it cannot verify and routes sensitive queries to a human — a search engine will happily return irrelevant or outdated results. For urgency context, please refer to the study's Introduction section.",
+    "urgent": "The urgency of this system is grounded in the administrative workload and query volume of BJMP facilities, as discussed in the study's Introduction. This prototype demonstrates architectural feasibility; the empirical justification for urgency is presented in Chapter One of the thesis.",
+}
 
 # ═══════════════════════════════════════════
 # GROQ
@@ -154,12 +95,16 @@ def generate_groq(prompt):
         r = requests.post(
             "https://api.groq.com/openai/v1/chat/completions",
             headers={"Authorization": f"Bearer {GROQ_KEY}", "Content-Type": "application/json"},
-            json={"model": "openai/gpt-oss-20b", "messages": [{"role": "user", "content": prompt}], "max_tokens": 512, "temperature": 0.1},
+            json={"model": "openai/gpt-oss-20b",
+                  "messages": [{"role": "user", "content": prompt}],
+                  "max_tokens": 512, "temperature": 0.1},
             timeout=30
         )
         if r.status_code != 200:
             return f"[API Error {r.status_code}: {r.json().get('error',{}).get('message','Unknown')}]"
         return r.json()["choices"][0]["message"]["content"]
+    except requests.exceptions.Timeout:
+        return "[Error: Timed out. Please try again.]"
     except Exception as e:
         return f"[Error: {str(e)}]"
 
@@ -185,10 +130,15 @@ If already self-contained, return it unchanged."""
         return query
 
 # ═══════════════════════════════════════════
-# CHAT
+# CITATION FORMATTER
 # ═══════════════════════════════════════════
 def format_citation(doc_title, doc_no, section, score):
     url = DOC_URLS.get(doc_no, "#")
+    page_match = re.search(r'p+\.?(\d+)', section)
+    if url != "#" and page_match:
+        page_num = page_match.group(1)
+        if url.endswith(".pdf"):
+            url += f"#page={page_num}"
     label = f"{doc_title} ({doc_no}), {section} ({score:.2f})"
     if url != "#":
         return f"- [{label}]({url})"
@@ -198,19 +148,35 @@ def format_confidence_bar(score):
     filled = int(score * 20)
     return "█" * filled + "░" * (20 - filled) + f" {score:.2f}"
 
-AUDIT_FILE = "audit_log.json"
+# ═══════════════════════════════════════════
+# SUGGESTED FOLLOW-UPS
+# ═══════════════════════════════════════════
+def get_suggestions(hits):
+    if not hits:
+        return ["What is the Freedom of Information procedure in BJMP?",
+                "What services are available under the BJMP Citizen's Charter?",
+                "What is the organizational structure of BJMP?"]
+    top_doc = hits[0]["chunk"]["doc_no"]
+    return SUGGESTIONS.get(top_doc, ["What are the requirements?", "How long does it take?", "Who do I contact?"])
 
-def save_audit(entry):
-    try:
-        with open(AUDIT_FILE) as f:
-            log = json.load(f)
-    except:
-        log = []
-    log.append(entry)
-    with open(AUDIT_FILE, "w") as f:
-        json.dump(log, f, indent=2)
+# ═══════════════════════════════════════════
+# META-QUESTION CHECK
+# ═══════════════════════════════════════════
+def check_meta(query):
+    q_lower = query.lower()
+    for key, response in META_RESPONSES.items():
+        if key in q_lower:
+            return response
+    return None
 
+# ═══════════════════════════════════════════
+# CHAT FUNCTION
+# ═══════════════════════════════════════════
 def chat_fn(query, history):
+    meta = check_meta(query)
+    if meta:
+        return meta + "\n" + CONTACT_INFO
+
     rewritten = rewrite_query(query, history)
     q = retriever_model.encode([rewritten], normalize_embeddings=True)
     q = np.asarray(q, dtype="float32")
@@ -230,7 +196,9 @@ def chat_fn(query, history):
             role = "User" if msg["role"] == "user" else "Assistant"
             context += f"{role}: {msg['content'][:300]}\n"
     system_prompt = """You are a helpful administrative assistant for the Philippine Bureau of Jail Management and Penology (BJMP).
-Tone: Warm, clear, professional. Speak naturally. Use "you" and "I" freely. Light conversational phrasing is fine but avoid slang.
+
+Tone: Warm, clear, professional. Speak naturally. Use "you" and "I" freely. Light conversational phrasing is fine ("I see," "Here's what I found") but avoid slang.
+
 Rules:
 - Answer ONLY using the provided passages. Every factual claim must be traceable to a passage.
 - Cite the document number and section for factual claims.
@@ -259,7 +227,6 @@ Rules:
     if any(kw in query.lower() for kw in SENSITIVITY):
         reasons.append("Sensitivity keyword")
     route = "HUMAN_REVIEW" if reasons else "AUTO"
-    save_audit({"timestamp": datetime.datetime.now().isoformat(), "query": query, "rewritten": rewritten, "route": route, "reasons": reasons, "top_scores": [round(h["score"],4) for h in hits]})
     display = ""
     if route == "HUMAN_REVIEW":
         display += "⚠️ *Routed to Human Review* — " + ", ".join(reasons) + "\n\n"
@@ -275,15 +242,55 @@ Rules:
             display += format_citation(c["doc_title"], c["doc_no"], c["section"], h["score"]) + "\n"
     if route == "HUMAN_REVIEW":
         display += "\n---\n*Flagged for human verification.*"
+    suggestions = get_suggestions(hits)
+    display += "\n\n**Suggested follow-ups:**\n"
+    for s in suggestions:
+        display += f"- {s}\n"
+    display += CONTACT_INFO
     return display
 
 # ═══════════════════════════════════════════
 # LAUNCH
 # ═══════════════════════════════════════════
-print("\n═══ LAUNCHING ═══")
-demo = gr.Blocks(title="JailTech AI — RAG PoC", theme=gr.themes.Soft())
+print("Launching Gradio...")
+
+BG_CSS = """
+<style>
+#bjmp-header {
+    background-image: linear-gradient(rgba(0, 20, 40, 0.7), rgba(0, 20, 40, 0.7)), url('https://i.imgur.com/Q1vdUii.png');
+    background-size: cover;
+    background-position: center top;
+    padding: 30px 20px;
+    border-radius: 10px;
+    margin-bottom: 15px;
+    text-align: center;
+}
+#bjmp-header h1 {
+    color: #ffffff;
+    font-size: 1.6em;
+    margin-bottom: 5px;
+    text-shadow: 0 2px 4px rgba(0,0,0,0.7);
+}
+#bjmp-header p {
+    color: #e0e0e0;
+    font-size: 0.9em;
+    margin: 0;
+    text-shadow: 0 1px 3px rgba(0,0,0,0.7);
+}
+</style>
+"""
+
+demo = gr.Blocks(title="JailTech AI — RAG PoC", theme=gr.themes.Soft(), head=BG_CSS)
 with demo:
-    gr.Markdown("# 🏛️ JailTech AI — RAG Proof of Concept")
-    gr.Markdown("*Non-evaluative demo. All outputs require human verification. No PDL, personnel, or intelligence content.*")
-    gr.ChatInterface(fn=chat_fn, title="BJMP Administrative Policy Assistant", description="Ask questions and follow up naturally.")
+    gr.HTML('<div id="bjmp-header"><h1>🏛️ JailTech AI — RAG Proof of Concept</h1><p>BJMP Administrative Policy Assistant | Non-Evaluative Demo | All outputs require human verification</p></div>')
+    gr.ChatInterface(fn=chat_fn,
+                     title="BJMP Administrative Policy Assistant",
+                     description="Ask questions and follow up naturally.",
+                     examples=[
+                         "What is the Freedom of Information procedure in BJMP?",
+                         "What services are available under the BJMP Citizen's Charter?",
+                         "What is the organizational structure of BJMP?",
+                         "What is the detention status of PDL Juan Dela Cruz?",
+                         "How is this more convenient than a search engine?",
+                     ])
 demo.launch(server_name="0.0.0.0", server_port=7860)   
